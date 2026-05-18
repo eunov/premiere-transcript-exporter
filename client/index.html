@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Transcript Exporter</title>
+  <style>
+    :root {
+      --bg:      #1e1e1e;
+      --surface: #272727;
+      --border:  #3a3a3a;
+      --text:    #d4d4d4;
+      --muted:   #888;
+      --accent:  #3b8eea;
+      --ok:      #4caf50;
+      --warn:    #f5a623;
+      --err:     #e05252;
+      --spin:    #3b8eea;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, "Segoe UI", sans-serif;
+      font-size: 12px;
+      padding: 12px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    h1 { font-size: 13px; font-weight: 600; color: #fff; }
+
+    #refresh-btn {
+      background: none;
+      border: none;
+      color: var(--muted);
+      font-size: 12px;
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: 3px;
+    }
+    #refresh-btn:hover { color: var(--text); background: #333; }
+
+    /* ── Project name ── */
+    #project-info {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ── Bin / folder selector ── */
+    .field-label {
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 3px;
+    }
+
+    #bin-select {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font-size: 12px;
+      padding: 5px 8px;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 8px center;
+      padding-right: 24px;
+    }
+    #bin-select:focus { outline: 1px solid var(--accent); }
+
+    /* ── Language selector ── */
+    #lang-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #lang-row .field-label { margin-bottom: 0; white-space: nowrap; }
+    #lang-select {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font-size: 11px;
+      padding: 4px 6px;
+      cursor: pointer;
+    }
+    #lang-select:focus { outline: 1px solid var(--accent); }
+
+    /* ── Sequence list ── */
+    #sequence-list {
+      flex: 1;
+      overflow-y: auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-height: 80px;
+    }
+
+    .seq-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 6px;
+      border-radius: 3px;
+      transition: background 0.1s;
+    }
+    .seq-row:hover { background: #333; }
+
+    /* Status dot / spinner */
+    .seq-icon {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--border);
+    }
+    .seq-icon.ok      { background: var(--ok); }
+    .seq-icon.warn    { background: var(--warn); }
+    .seq-icon.err     { background: var(--err); }
+    .seq-icon.working {
+      background: transparent;
+      border: 2px solid var(--spin);
+      border-top-color: transparent;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .seq-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .seq-status {
+      font-size: 10px;
+      color: var(--muted);
+      flex-shrink: 0;
+      text-align: right;
+      max-width: 80px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .seq-status.ok   { color: var(--ok); }
+    .seq-status.warn { color: var(--warn); }
+    .seq-status.err  { color: var(--err); }
+
+    #empty-msg {
+      color: var(--muted);
+      font-style: italic;
+      text-align: center;
+      margin: auto;
+      padding: 12px;
+    }
+
+    /* ── Export button ── */
+    #export-btn {
+      width: 100%;
+      padding: 9px;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      letter-spacing: 0.02em;
+    }
+    #export-btn:hover   { background: #2f7de0; }
+    #export-btn:active  { background: #2570cc; }
+    #export-btn:disabled {
+      background: #383838;
+      color: var(--muted);
+      cursor: not-allowed;
+    }
+
+    /* ── Bottom info area ── */
+    #status-bar {
+      font-size: 11px;
+      color: var(--muted);
+      min-height: 14px;
+      line-height: 1.4;
+    }
+    #status-bar.ok  { color: var(--ok); }
+    #status-bar.err { color: var(--err); }
+
+    #output-link {
+      display: none;
+      font-size: 11px;
+      color: var(--accent);
+      cursor: pointer;
+      word-break: break-all;
+    }
+    #output-link:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <h1>Transcript Exporter</h1>
+    <button id="refresh-btn" title="Reload project">↻ Refresh</button>
+  </div>
+
+  <div id="project-info">Loading project…</div>
+
+  <!-- Bin / folder picker -->
+  <div>
+    <div class="field-label">Export sequences from</div>
+    <select id="bin-select" disabled>
+      <option value="/">Loading…</option>
+    </select>
+  </div>
+
+  <!-- Language for auto-transcription -->
+  <div id="lang-row">
+    <div class="field-label">Transcription language</div>
+    <select id="lang-select">
+      <option value="en-US">English (US)</option>
+      <option value="en-GB">English (UK)</option>
+      <option value="es-ES">Spanish</option>
+      <option value="fr-FR">French</option>
+      <option value="de-DE">German</option>
+      <option value="pt-BR">Portuguese (BR)</option>
+      <option value="it-IT">Italian</option>
+      <option value="ja-JP">Japanese</option>
+      <option value="ko-KR">Korean</option>
+      <option value="zh-CN">Chinese (Simplified)</option>
+    </select>
+  </div>
+
+  <!-- Sequence list -->
+  <div id="sequence-list">
+    <span id="empty-msg">No sequences found.</span>
+  </div>
+
+  <button id="export-btn" disabled>Export All Transcripts</button>
+
+  <div id="status-bar"></div>
+  <div id="output-link">📂 Open transcripts folder</div>
+
+  <script src="CSInterface.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
