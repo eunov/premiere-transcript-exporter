@@ -1,90 +1,48 @@
 # Transcript Exporter for Adobe Premiere Pro
 
-A CEP panel that exports the Speech to Text transcript for every sequence in the open project into plain `.txt` files — so the content pipeline always has fresh transcripts without any manual work.
+I got sick of exporting Premiere transcripts one sequence at a time. I wanted a way to batch-export a whole project at once and keep the text on my drive for things like learning, branding, tone of voice work, and repurposing.
 
----
+This is a small Premiere Pro panel that does exactly that. Open it, click one button, and every sequence in your project gets its Speech to Text transcript written to a `.txt` file inside a `transcripts/` folder next to your `.prproj`.
 
 ## Requirements
 
-- **Premiere Pro 2022 (v22.0) or later** — Speech to Text was introduced in this version.
-- **macOS** — the install script targets Mac. For Windows, see manual install below.
-- Sequences must have had **Speech to Text** run on them (Text panel > Transcript tab) before exporting.
+You'll need Premiere Pro 2022 (v22.0) or later, since that's when Speech to Text shipped. The install script in this repo is written for macOS; Windows users can install by hand using the steps further down. And each sequence has to have already had Speech to Text run on it (Text panel, then the Transcript tab) before the panel can export anything from it.
 
----
+## Install on macOS
 
-## Install (macOS — one time)
+From the repo root:
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-Then:
-1. Quit Premiere Pro if open.
-2. Reopen Premiere Pro.
-3. **Window > Extensions > Transcript Exporter**
+Quit Premiere if it's open, then reopen it. You'll find the panel under **Window > Extensions > Transcript Exporter**.
 
----
+## Install on Windows
 
-## Install (Windows — manual)
+Copy the `com.acquisition.transcriptexporter` folder into:
 
-1. Copy the entire `com.acquisition.transcriptexporter` folder to:
-   ```
-   %APPDATA%\Adobe\CEP\extensions\com.acquisition.transcriptexporter\
-   ```
-2. Enable unsigned extensions in the registry:
-   - Open `regedit`
-   - Navigate to `HKEY_CURRENT_USER\SOFTWARE\Adobe\CSXS.12` (Premiere 2025/2026)
-   - Add a String value: `PlayerDebugMode` = `1`
-   - Repeat for `CSXS.11`, `CSXS.10`, and `CSXS.9` if those keys exist (for older Premiere versions).
-3. Restart Premiere Pro.
-
----
-
-## How to use
-
-1. Open a Premiere Pro project.
-2. Make sure Speech to Text has been run on your sequences (Text panel > Transcript tab).
-3. Open the panel: **Window > Extensions > Transcript Exporter**.
-4. Click **Export All Transcripts**.
-
-Transcript files are saved to:
 ```
-[same folder as your .prproj file]/transcripts/[Sequence Name].txt
+%APPDATA%\Adobe\CEP\extensions\com.acquisition.transcriptexporter\
 ```
 
-The panel shows a colored dot for each sequence:
-- **Green** — transcript exported successfully.
-- **Yellow** — no transcript found (Speech to Text not yet run on this sequence).
-- **Red** — file write error.
+Then open `regedit` and enable unsigned extensions. Navigate to `HKEY_CURRENT_USER\SOFTWARE\Adobe\CSXS.12` for Premiere 2025 and 2026, and add a String value called `PlayerDebugMode` set to `1`. If you need older versions to work too, do the same thing under `CSXS.11`, `CSXS.10`, and `CSXS.9`. Restart Premiere after.
 
----
+## How to use it
 
-## How transcript extraction works
+Open a Premiere project, make sure Speech to Text has been run on the sequences you care about, then open the panel from **Window > Extensions > Transcript Exporter** and click **Export All Transcripts**. The files land in `[your-project-folder]/transcripts/[Sequence Name].txt`.
 
-The plugin uses three methods in order, falling back to the next if the previous yields nothing:
+As the export runs, each sequence gets a colored dot next to its name. Green means the transcript was exported. Yellow means there was nothing to export, usually because Speech to Text was never run on that sequence. Red means something went wrong writing the file.
 
-1. **Premiere scripting API** (`sequence.getText()`) — works in Premiere Pro 23.3+.
-2. **Caption track scan** — walks each sequence's video tracks for caption clip text.
-3. **Project file parser** — decompresses the `.prproj` file and searches the XML for caption/transcript nodes. This catches data even when the scripting API doesn't expose it.
+## How it pulls the transcripts
 
----
-
-## Connecting to the content pipeline
-
-The `transcripts/` folder sits next to every `.prproj` file. Point the content pipeline's watch folder at the parent directory (or at each project's `transcripts/` subfolder) and it will pick up new `.txt` files automatically whenever you run an export.
-
----
+There are three different ways to get transcript text out of Premiere, and the panel tries them in order. First it asks the scripting API directly using `sequence.getText()`, which works on Premiere Pro 23.3 and up. If that comes back empty, it walks each sequence's video tracks looking for caption clips and reads the text off of those. If both of those still give nothing, it falls back to decompressing the `.prproj` file itself and scanning the XML inside for caption and transcript nodes. That last path is what catches data even when the scripting API doesn't surface it.
 
 ## Troubleshooting
 
-**Panel doesn't appear in Window > Extensions**
-- Confirm the install script ran without errors.
-- Confirm `PlayerDebugMode 1` is set (run `defaults read com.adobe.CSXS.11 PlayerDebugMode`).
-- Restart Premiere Pro completely.
+**The panel doesn't show up in Window > Extensions.** First check that the install script actually finished without errors. Then confirm `PlayerDebugMode` is set by running `defaults read com.adobe.CSXS.11 PlayerDebugMode` in Terminal. If both of those check out, quit Premiere and reopen it.
 
-**All sequences show "no transcript"**
-- Open the Text panel in Premiere (Window > Text), select the sequence, and check the Transcript tab. If it's empty, click "Transcribe" to run Speech to Text first.
+**Every sequence shows up as "no transcript."** Open the Text panel inside Premiere (Window > Text), pick a sequence, and look at the Transcript tab. If it's blank, you need to click Transcribe and let Speech to Text actually run before the exporter has anything to grab.
 
-**Transcript text looks garbled**
-- This can happen if the project file is very large and the parser is reading a stale save. Click "↻ Refresh" and then export again — the plugin saves the project before parsing.
+**The transcript text looks garbled.** Usually this means the project file is large and the parser is reading an older saved copy. Hit the ↻ Refresh button in the panel and export again. The plugin saves the project before parsing, so a refresh clears up most of these cases.
