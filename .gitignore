@@ -1,3 +1,6 @@
 .DS_Store
 *.swp
 *~
+
+# CEP remote-debug config — dev-only, not for production installs
+.debug

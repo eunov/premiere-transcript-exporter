@@ -19,7 +19,7 @@
       <Locale Code="All"/>
     </LocaleList>
     <RequiredRuntimeList>
-      <RequiredRuntime Name="CSXS" Version="7.0"/>
+      <RequiredRuntime Name="CSXS" Version="12.0"/>
     </RequiredRuntimeList>
   </ExecutionEnvironment>
 
@@ -30,7 +30,9 @@
           <MainPath>./client/index.html</MainPath>
           <ScriptPath>./host/host.jsx</ScriptPath>
           <CEFCommandLine>
-            <!-- Enables Node.js require() inside the panel -->
+            <!-- Enables Node.js require() inside the panel. Needed by main.js
+                 for fs/zlib/path during transcript export (writing .txt files
+                 and parsing the binary .prproj as a fallback transcript source). -->
             <Parameter>--enable-nodejs</Parameter>
             <Parameter>--mixed-context</Parameter>
           </CEFCommandLine>

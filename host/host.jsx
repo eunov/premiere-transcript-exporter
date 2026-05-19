@@ -1,10 +1,92 @@
 /**
  * Transcript Exporter — ExtendScript host
- * Runs inside Premiere Pro's scripting engine.
+ *
+ * ExtendScript engine 4.5.6 (Premiere Pro 26+) does NOT ship a native JSON
+ * object. The polyfill below adds JSON.stringify and JSON.parse so the rest
+ * of this file can talk to the panel in JSON. Source is pure ASCII — no
+ * literal control chars or unicode in regex character classes, which the
+ * 4.5.6 parser refuses to load.
  */
 
-// ─── Project info ─────────────────────────────────────────────────────────────
+if (typeof JSON !== "object") { JSON = {}; }
+(function () {
+    function quote(s) {
+        var r = "\"";
+        for (var i = 0; i < s.length; i++) {
+            var cc = s.charCodeAt(i);
+            if (cc === 92)      { r += "\\\\"; }
+            else if (cc === 34) { r += "\\\""; }
+            else if (cc === 8)  { r += "\\b"; }
+            else if (cc === 9)  { r += "\\t"; }
+            else if (cc === 10) { r += "\\n"; }
+            else if (cc === 12) { r += "\\f"; }
+            else if (cc === 13) { r += "\\r"; }
+            else if (cc < 32) {
+                var h = cc.toString(16);
+                r += "\\u" + ("0000" + h).slice(-4);
+            } else {
+                r += s.charAt(i);
+            }
+        }
+        return r + "\"";
+    }
 
+    function str(value) {
+        if (value === null) return "null";
+        if (value === undefined) return undefined;
+        var t = typeof value;
+        if (t === "number")  return isFinite(value) ? String(value) : "null";
+        if (t === "boolean") return String(value);
+        if (t === "string")  return quote(value);
+        if (t === "object") {
+            var isArr = (value instanceof Array) ||
+                        (value && typeof value.length === "number" && typeof value.splice === "function");
+            if (isArr) {
+                var parts = [];
+                for (var i = 0; i < value.length; i++) {
+                    var v = str(value[i]);
+                    parts.push(v === undefined ? "null" : v);
+                }
+                return "[" + parts.join(",") + "]";
+            }
+            var pairs = [];
+            for (var k in value) {
+                if (value.hasOwnProperty(k)) {
+                    var v2 = str(value[k]);
+                    if (v2 !== undefined) pairs.push(quote(k) + ":" + v2);
+                }
+            }
+            return "{" + pairs.join(",") + "}";
+        }
+        return undefined;
+    }
+
+    if (typeof JSON.stringify !== "function") {
+        JSON.stringify = function (value) {
+            var r = str(value);
+            return r === undefined ? "null" : r;
+        };
+    }
+
+    if (typeof JSON.parse !== "function") {
+        JSON.parse = function (text) {
+            return eval("(" + String(text) + ")");
+        };
+    }
+})();
+
+// ─── Diagnostic helpers ──────────────────────────────────────────────────────
+function pingHost() { return "pong-42"; }
+function jsonProbe() {
+    if (typeof JSON === "undefined") return "JSON_UNDEFINED";
+    if (typeof JSON.stringify !== "function") return "JSON_STRINGIFY_MISSING";
+    try {
+        var s = JSON.stringify({ a: 1, b: "two", c: [1, 2, "three"] });
+        return "JSON_OK:" + s;
+    } catch (e) { return "JSON_THROW:" + e.toString(); }
+}
+
+// ─── Project info ────────────────────────────────────────────────────────────
 function getProjectInfo() {
     try {
         var project = app.project;
@@ -12,24 +94,68 @@ function getProjectInfo() {
         if (!project.path || project.path === "")
             return JSON.stringify({ error: "Project not saved yet. Save first, then try again." });
 
-        // Walk the bin tree, collecting sequences and their bin locations
-        var binList   = [];   // [{ id, name, path, sequenceCount }]
-        var seqList   = [];   // [{ id, name, binId, binPath }]
-        var seqIds    = {};   // quick lookup: sequenceID -> true
+        // Phase 1: walk the bin tree. Build:
+        //   allBins[]      — every bin: { id, name, path }
+        //   nodeIdToBin{}  — nodeId -> { path, id } for every non-bin ProjectItem
+        //                    (so sequences can resolve to their bin via
+        //                    sequence.projectItem.nodeId — added in PPro 22)
+        var allBins = [{ id: "root", name: "All sequences", path: "/" }];
+        var nodeIdToBin = {};
+        walkBins(project.rootItem, "/", "root", allBins, nodeIdToBin);
 
-        // Build a set of valid sequence IDs
+        // Phase 2: iterate sequences. Resolve each to its bin via its
+        // projectItem. Falls back to root if the lookup misses for any reason.
+        var seqList = [];
+        var binCounts = {};
         var allSeqs = project.sequences;
         for (var s = 0; s < allSeqs.numSequences; s++) {
-            seqIds[allSeqs[s].sequenceID] = true;
+            var seq = allSeqs[s];
+            var binPath = "/";
+            var binId   = "root";
+
+            try {
+                if (seq.projectItem) {
+                    var pi = seq.projectItem;
+                    var resolved = null;
+                    try { resolved = nodeIdToBin[pi.nodeId]; } catch (e) {}
+                    if (resolved) {
+                        binPath = resolved.path;
+                        binId   = resolved.id;
+                    }
+                }
+            } catch (e) {}
+
+            seqList.push({
+                id:      seq.sequenceID,
+                name:    seq.name,
+                binId:   binId,
+                binPath: binPath
+            });
+
+            binCounts[binPath] = (binCounts[binPath] || 0) + 1;
         }
 
-        // Recursive bin walker
-        walkBin(project.rootItem, "/", "", binList, seqList, seqIds);
+        // Phase 3: roll up bin counts to include descendants; drop empty bins.
+        var binList = [];
+        for (var i = 0; i < allBins.length; i++) {
+            var b = allBins[i];
+            var count = binCounts[b.path] || 0;
+            for (var j = 0; j < allBins.length; j++) {
+                if (i === j) continue;
+                if (allBins[j].path.indexOf(b.path) === 0 && allBins[j].path !== b.path) {
+                    count += (binCounts[allBins[j].path] || 0);
+                }
+            }
+            if (count > 0 || b.path === "/") {
+                b.sequenceCount = count;
+                binList.push(b);
+            }
+        }
 
         return JSON.stringify({
-            path:     project.path,
-            name:     project.name,
-            bins:     binList,
+            path:      project.path,
+            name:      project.name,
+            bins:      binList,
             sequences: seqList
         });
 
@@ -38,67 +164,29 @@ function getProjectInfo() {
     }
 }
 
-/**
- * Recursively walks a bin (ProjectItem of type BIN).
- * Populates binList and seqList in place.
- */
-function walkBin(bin, binPath, binId, binList, seqList, seqIds) {
-    var children = bin.children;
+function walkBins(item, binPath, binId, allBins, nodeIdToBin) {
+    var children = item.children;
     if (!children) return;
-
-    var localSeqCount = 0;
 
     for (var i = 0; i < children.numItems; i++) {
         var child = children[i];
+        var childNodeId = null;
+        try { childNodeId = child.nodeId; } catch (e) {}
 
-        // Type 2 = BIN
         if (child.type === ProjectItemType.BIN) {
             var childPath = (binPath === "/") ? ("/" + child.name + "/") : (binPath + child.name + "/");
-            var childId   = child.nodeId || child.name; // nodeId not always available
-            walkBin(child, childPath, childId, binList, seqList, seqIds);
+            var childId   = childNodeId || child.name;
+            allBins.push({ id: childId, name: child.name, path: childPath });
+            walkBins(child, childPath, childId, allBins, nodeIdToBin);
+        } else if (childNodeId !== null) {
+            // Non-bin: register so a sequence's projectItem.nodeId can resolve
+            // back to this bin location.
+            nodeIdToBin[childNodeId] = { path: binPath, id: binId };
         }
-
-        // Type 1 = CLIP (sequences appear as clips in the project panel)
-        if (child.type === ProjectItemType.CLIP || child.type === 1) {
-            // Check if this project item corresponds to a sequence
-            try {
-                // getMediaPath() is empty for sequences; use the sequence lookup
-                // A sequence's projectItem matches when its nodeId aligns
-                var nodeId = child.nodeId;
-                if (seqIds[nodeId]) {
-                    seqList.push({
-                        id:      nodeId,
-                        name:    child.name,
-                        binId:   binId || "root",
-                        binPath: binPath
-                    });
-                    localSeqCount++;
-                }
-            } catch (e) {}
-        }
-    }
-
-    // Register this bin only if it (or its descendants) hold sequences
-    var childBinSeqCount = 0;
-    for (var b = 0; b < binList.length; b++) {
-        if (binList[b].path.indexOf(binPath) === 0 && binList[b].path !== binPath) {
-            childBinSeqCount += binList[b].sequenceCount;
-        }
-    }
-    var totalCount = localSeqCount + childBinSeqCount;
-
-    if (totalCount > 0 || binPath === "/") {
-        binList.push({
-            id:            binId || "root",
-            name:          (binPath === "/") ? "All sequences" : bin.name,
-            path:          binPath,
-            sequenceCount: totalCount
-        });
     }
 }
 
-// ─── Save project ─────────────────────────────────────────────────────────────
-
+// ─── Save project ────────────────────────────────────────────────────────────
 function saveProject() {
     try {
         app.project.save();
@@ -108,12 +196,7 @@ function saveProject() {
     }
 }
 
-// ─── Check transcript status for a single sequence ───────────────────────────
-
-/**
- * Returns { id, hasTranscript, text } for the given sequenceId.
- * "hasTranscript" is true if any text was found via the scripting API.
- */
+// ─── Check transcript status for a single sequence ──────────────────────────
 function checkTranscript(sequenceId) {
     try {
         var seq = findSequenceById(sequenceId);
@@ -121,56 +204,40 @@ function checkTranscript(sequenceId) {
 
         var entry = extractOneSequence(seq);
         return JSON.stringify({
-            id:          sequenceId,
-            hasTranscript: !!(entry.text && entry.text.trim().length > 0),
-            text:        entry.text || null,
-            method:      entry.method
+            id:            sequenceId,
+            hasTranscript: !!(entry.text && entry.text.length > 0),
+            text:          entry.text || null,
+            method:        entry.method
         });
     } catch (e) {
         return JSON.stringify({ error: e.toString() });
     }
 }
 
-// ─── Trigger Speech to Text transcription ────────────────────────────────────
-
-/**
- * Starts Premiere Pro's Speech to Text on the given sequence.
- *
- * Premiere Pro 22.0+ added sequence.autoTranscribeSequence().
- * The method is asynchronous — it starts transcription in the background.
- * The panel polls checkTranscript() to detect completion.
- *
- * @param {string} sequenceId
- * @param {string} language  BCP-47 code, e.g. "en-US"
- */
+// ─── Trigger Speech to Text ─────────────────────────────────────────────────
 function triggerTranscription(sequenceId, language) {
     try {
         var lang = language || "en-US";
         var seq  = findSequenceById(sequenceId);
         if (!seq) return JSON.stringify({ success: false, error: "Sequence not found." });
 
-        // ── Method A: autoTranscribeSequence (Premiere 22.0+) ─────────────────
         try {
             if (typeof seq.autoTranscribeSequence === "function") {
-                // Params: language (string), fillGaps (bool), exportSD (bool)
                 seq.autoTranscribeSequence(lang, false, false);
                 return JSON.stringify({ success: true, method: "autoTranscribeSequence" });
             }
-        } catch (e) { /* fall through */ }
+        } catch (e) {}
 
-        // ── Method B: activate sequence + menu command ────────────────────────
-        // Menu command IDs for "Transcribe Sequence" in Premiere Pro.
-        // These IDs vary by version; we try a known range.
         try {
             app.project.activeSequence = seq;
-            var cmdIds = [3694, 3560, 3695, 3696]; // known candidates
+            var cmdIds = [3694, 3560, 3695, 3696];
             for (var i = 0; i < cmdIds.length; i++) {
                 try {
                     app.executeMenuCommand(cmdIds[i]);
                     return JSON.stringify({ success: true, method: "menuCommand_" + cmdIds[i] });
-                } catch (e2) { /* try next */ }
+                } catch (e2) {}
             }
-        } catch (e) { /* fall through */ }
+        } catch (e) {}
 
         return JSON.stringify({ success: false, error: "autoTranscribeSequence API not available. Run Speech to Text manually in Premiere's Text panel, then export." });
 
@@ -179,14 +246,7 @@ function triggerTranscription(sequenceId, language) {
     }
 }
 
-// ─── Bulk API extraction ──────────────────────────────────────────────────────
-
-/**
- * Attempts to extract transcript text for a list of sequence IDs via the
- * Premiere scripting API.
- *
- * @param {string} sequenceIdsJson  JSON array of sequence ID strings
- */
+// ─── Bulk API extraction ─────────────────────────────────────────────────────
 function extractTranscriptsForIds(sequenceIdsJson) {
     var out = { results: [] };
     try {
@@ -205,8 +265,7 @@ function extractTranscriptsForIds(sequenceIdsJson) {
     return JSON.stringify(out);
 }
 
-// ─── Internal helpers ─────────────────────────────────────────────────────────
-
+// ─── Internal helpers ────────────────────────────────────────────────────────
 function findSequenceById(id) {
     var seqs = app.project.sequences;
     for (var i = 0; i < seqs.numSequences; i++) {
@@ -216,76 +275,121 @@ function findSequenceById(id) {
 }
 
 function extractOneSequence(seq) {
-    var entry = { id: seq.sequenceID, name: seq.name };
+    var entry = { id: seq.sequenceID, name: seq.name, attempts: [] };
 
-    // Method A: sequence.getText() — Premiere Pro 23.3+
+    function note(s) { entry.attempts.push(s); }
+    function len(v) {
+        if (v === null) return "null";
+        if (v === undefined) return "undef";
+        if (typeof v !== "string") return "type=" + typeof v;
+        return "len=" + v.length;
+    }
+
+    // ── Promote to active sequence, then restore on the way out ────────────
+    // project.sequences[i] returns a thin proxy. The full API surface (where
+    // it exists) is only exposed via app.project.activeSequence. We restore
+    // the original active sequence so clicking Export doesn't yank the user's
+    // timeline to whichever sequence was processed last.
+    var act = seq;
+    var prevActive = null;
+    try { prevActive = app.project.activeSequence; } catch (e) {}
     try {
-        if (typeof seq.getText === "function") {
-            var raw = seq.getText(SeqTextType.TRANSCRIPT_TEXT);
-            if (raw && raw.trim().length > 0) {
-                entry.text   = raw;
-                entry.method = "getText";
+        app.project.activeSequence = seq;
+        act = app.project.activeSequence;
+    } catch (e) { note("set activeSequence threw: " + e.toString()); }
+
+    function restoreActive() {
+        try { if (prevActive) app.project.activeSequence = prevActive; } catch (e) {}
+    }
+
+    // ── Method 1: getText(SeqTextType.TRANSCRIPT_TEXT, srcEnabled) ──
+    // Premiere Pro 26+ removed this API from ExtendScript, so the loop just
+    // exits quickly when the method doesn't exist. Kept for older versions.
+    if (typeof act.getText === "function") {
+        var calls = [];
+        if (typeof SeqTextType !== "undefined") {
+            calls.push(["SeqTextType.TRANSCRIPT_TEXT,false", SeqTextType.TRANSCRIPT_TEXT, false]);
+            calls.push(["SeqTextType.TRANSCRIPT_TEXT,true",  SeqTextType.TRANSCRIPT_TEXT, true]);
+            calls.push(["SeqTextType.TRANSCRIPT_TEXT",       SeqTextType.TRANSCRIPT_TEXT]);
+        }
+        for (var n = 0; n < 5; n++) {
+            calls.push(["getText(" + n + ",false)", n, false]);
+            calls.push(["getText(" + n + ",true)",  n, true]);
+            calls.push(["getText(" + n + ")",       n]);
+        }
+        for (var i = 0; i < calls.length; i++) {
+            var cs = calls[i];
+            try {
+                var raw = (cs.length === 2) ? act.getText(cs[1]) : act.getText(cs[1], cs[2]);
+                if (typeof raw === "string" && raw.length > 20) {
+                    entry.text = raw; entry.method = cs[0];
+                    restoreActive();
+                    return entry;
+                }
+            } catch (e) {}
+        }
+        note("getText exists but all call shapes rejected/empty");
+    } else {
+        note("act.getText not a function");
+    }
+
+    // ── Method 2: captionTracks (older Premiere builds) ──
+    try {
+        var ctList = null;
+        if (typeof act.getCaptionTracks === "function") ctList = act.getCaptionTracks();
+        else if (act.captionTracks) ctList = act.captionTracks;
+        if (ctList) {
+            var nt = ctList.numTracks !== undefined ? ctList.numTracks : ctList.length;
+            var lines = [];
+            for (var t = 0; t < nt; t++) {
+                var ct = ctList[t];
+                if (!ct) continue;
+                var clips = ct.clips || ct.captions;
+                if (!clips) continue;
+                var nClips = clips.numItems !== undefined ? clips.numItems : clips.length;
+                for (var c = 0; c < nClips; c++) {
+                    var clip = clips[c];
+                    try {
+                        var txt = clip.captionText || clip.text || (typeof clip.getText === "function" && clip.getText()) || "";
+                        if (txt && txt.length > 0) lines.push(txt);
+                    } catch (e) {}
+                }
+            }
+            if (lines.length > 0) {
+                entry.text = lines.join(" "); entry.method = "captionTracks";
+                restoreActive();
                 return entry;
             }
         }
-    } catch (e) {}
+    } catch (e) { note("captionTracks threw: " + e.toString()); }
 
-    // Method B: iterate caption clips on video tracks
+    // ── Method 3: markers (some workflows put transcripts here) ──
     try {
-        var captionText = readCaptionTracks(seq);
-        if (captionText) {
-            entry.text   = captionText;
-            entry.method = "captionTrack";
+        var markerText = readTranscriptMarkers(act);
+        if (markerText && markerText.length > 50) {
+            entry.text = markerText; entry.method = "markers";
+            restoreActive();
             return entry;
         }
     } catch (e) {}
 
-    // Method C: sequence markers
-    try {
-        var markerText = readTranscriptMarkers(seq);
-        if (markerText) {
-            entry.text   = markerText;
-            entry.method = "markers";
-            return entry;
-        }
-    } catch (e) {}
-
+    // No method worked. .prproj file parsing on the panel side is the
+    // primary path for Premiere 26+ where ExtendScript can't reach transcripts.
+    note("no in-engine transcript path available; falling through to .prproj parse");
     entry.text   = null;
     entry.method = "none";
+    restoreActive();
     return entry;
 }
 
-function readCaptionTracks(seq) {
-    var lines = [];
-    var videoTracks = seq.videoTracks;
-    for (var t = 0; t < videoTracks.numTracks; t++) {
-        var track = videoTracks[t];
-        var clips  = track.clips;
-        for (var c = 0; c < clips.numItems; c++) {
-            var clip = clips[c];
-            try {
-                if (clip.captionText && clip.captionText.length > 0) {
-                    lines.push(clip.captionText);
-                    continue;
-                }
-            } catch (e) {}
-            try {
-                var nm = clip.name || "";
-                if (nm.length > 0 && nm.length < 300 && nm.indexOf(".") === -1) {
-                    lines.push(nm);
-                }
-            } catch (e) {}
-        }
-    }
-    return lines.join(" ").trim();
-}
-
 function readTranscriptMarkers(seq) {
+    if (!seq || !seq.markers) return "";
     var text = [];
     var markers = seq.markers;
-    for (var i = 0; i < markers.numMarkers; i++) {
+    var n = markers.numMarkers || 0;
+    for (var i = 0; i < n; i++) {
         var m = markers[i];
-        if (m.comments && m.comments.length > 0) text.push(m.comments);
+        if (m && m.comments && m.comments.length > 0) text.push(m.comments);
     }
-    return text.join(" ").trim();
+    return text.join(" ");
 }
