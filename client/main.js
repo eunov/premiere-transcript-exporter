@@ -378,9 +378,7 @@ async function runExportInner() {
     ? allSequences
     : allSequences.filter(s => s.binPath === selectedPath || s.binPath.startsWith(selectedPath));
 
-  const lang = langSelect.value;
-
-  // 1. Save project so .prproj on disk is fresh
+  // 1. Save project so the .prproj on disk is fresh
   setStatus("Saving project…", "");
   await evalScriptAsync("saveProject()");
 
@@ -390,116 +388,139 @@ async function runExportInner() {
   if (!fs.existsSync(transcriptsDir)) fs.mkdirSync(transcriptsDir, { recursive: true });
   outputFolder = transcriptsDir;
 
-  // 3. Extract transcripts via ExtendScript API for all targets at once
+  const methodMap = {};      // id → how the transcript was obtained
+  const textMap   = {};      // id → final transcript text
+  const diag      = [];      // diagnostic lines
+
+  // 3. Legacy path: ask the ExtendScript API for a whole-sequence transcript.
+  //    Works on older Premiere where a sequence carries its own transcript; on
+  //    Premiere 26 this comes back empty and we fall through to slice mode.
   setStatus("Reading transcripts…", "");
   const idList = targets.map(s => s.id);
-  let apiMap    = {};  // id → text
-  let methodMap = {};  // id → method name (which extraction worked)
-  let attemptsByName = {}; // sequenceName → attempts[] (for diagnostic file)
-
   try {
     const apiRaw  = await evalScriptAsync(`extractTranscriptsForIds(${JSON.stringify(JSON.stringify(idList))})`);
     const apiData = JSON.parse(apiRaw);
     for (const r of (apiData.results || [])) {
-      if (r.text && r.text.trim().length > 0) apiMap[r.id] = r.text;
-      methodMap[r.id] = r.method || "none";
-      attemptsByName[r.name || r.id] = r.attempts || [];
+      if (r.text && r.text.trim().length > 0) { textMap[r.id] = r.text; methodMap[r.id] = r.method || "api"; }
     }
   } catch (e) { console.warn("API extraction error:", e); }
 
-  // 4. For sequences with no API text, parse transcripts out of the .prproj.
-  // The .prproj is gzip-compressed XML holding all transcripts as base64
-  // FlatBuffer blobs inside <ExternallyProvidedTranscriptDocument>. We decode
-  // each blob, recover the words, and match transcripts to sequences by
-  // content overlap with the sequence name (sequence "Nobody Got Rich on an
-  // IRA" matches the transcript starting with that phrase, etc).
-  const needsFile = targets.filter(s => !apiMap[s.id]);
-  let parsedMap = {};
-  let parseDiag = [];
-  let unmatchedDocs = [];
-  if (needsFile.length > 0) {
-    setStatus("Parsing project file…", "");
+  // 4. Slice mode: parse the recording transcript(s) out of the .prproj WITH
+  //    timings, then for each sequence read its clip in/out windows and slice
+  //    the transcript to just those words. This is what makes a podcast project
+  //    (many clips, one shared transcript) export correctly.
+  const needsSlice = targets.filter(s => !textMap[s.id]);
+  let transcripts = [];
+  if (needsSlice.length > 0) {
+    setStatus("Parsing project transcript…", "");
     try {
-      const r = parseProjectFile(projectInfo.path, needsFile);
-      parsedMap = r.matches;
-      parseDiag = r.diagnostic;
-      unmatchedDocs = r.unmatched || [];
+      transcripts = parseTimedTranscripts(projectInfo.path);
+      diag.push("Parsed " + transcripts.length + " timed transcript(s): " +
+        transcripts.map(t => "doc" + t.objId + "=" + t.wordCount + "w/" + t.span.toFixed(0) + "s").join(", "));
     } catch (e) {
-      console.error("Project file parse error:", e);
-      parseDiag.push("parseProjectFile threw: " + e.message);
+      diag.push("parseTimedTranscripts threw: " + e.message);
     }
-  }
 
-  // 4b. For any sequence still without a transcript AND we have unused
-  // dedicated docs available, prompt the user to assign manually.
-  const orphans = targets.filter(s => !apiMap[s.id] && !parsedMap[s.id]);
-  if (orphans.length > 0 && unmatchedDocs.length > 0) {
-    setStatus("Waiting for transcript assignment…", "");
-    const manual = await promptForAssignments(orphans, unmatchedDocs);
-    // manual is { seqId: { text, docId } } so we don't pollute parsedMap with
-    // composite keys when iterating.
-    for (const seqId of Object.keys(manual)) {
-      parsedMap[seqId] = manual[seqId].text;
-      parseDiag.push("MANUAL ASSIGN: " + seqId + " <- doc " + manual[seqId].docId);
-    }
-  }
+    for (const seq of needsSlice) {
+      setRowIcon(seq.id, "working", "slicing…");
 
-  // 5. Identify sequences that still have no transcript → auto-transcribe
-  const needsTranscription = targets.filter(s => !apiMap[s.id] && !parsedMap[s.id]);
+      let winData = {};
+      try { winData = safeJSON(await evalScriptAsync(`getSequenceWindows(${JSON.stringify(seq.id)})`)); }
+      catch (e) { winData = {}; }
 
-  if (needsTranscription.length > 0) {
-    setStatus(`Transcribing ${needsTranscription.length} sequence(s)…`, "");
+      const clips = (winData && winData.clips) ? winData.clips : [];
+      const rawWindows = clips.filter(c => c.inSec != null && c.outSec != null && (c.outSec - c.inSec) > 0.25);
 
-    for (const seq of needsTranscription) {
-      setRowIcon(seq.id, "working", "transcribing…");
-      const triggerRaw = await evalScriptAsync(
-        `triggerTranscription(${JSON.stringify(seq.id)}, ${JSON.stringify(lang)})`
-      );
-      const triggerResult = safeJSON(triggerRaw);
-
-      if (!triggerResult.success) {
-        // Can't trigger transcription — mark as skipped
-        setRowIcon(seq.id, "warn", "manual STT needed");
+      if (rawWindows.length === 0) {
+        diag.push(seq.name + ": no clip source windows (run from a sequence with linked source clips)");
+        continue;
+      }
+      if (transcripts.length === 0) {
+        diag.push(seq.name + ": windows found but project has no transcript to slice");
         continue;
       }
 
-      // Poll until transcript appears (up to ~3 minutes)
-      const text = await pollForTranscript(seq.id, 180, 4000);
+      // A clip's video + audio (and stereo) track items each report the SAME
+      // source window, so windows arrive 2–3× over. Group by source media, then
+      // pick the source the clip is actually cut from.
+      const bySource = {};
+      for (const w of rawWindows) {
+        const key = w.source || "(unnamed)";
+        (bySource[key] = bySource[key] || []).push(w);
+      }
+      // Music / SFX beds run the full length of a clip, so "most coverage" would
+      // pick a music track over the recording — and slicing the transcript at a
+      // music cue's timecode yields garbage. The transcript belongs to the
+      // SPOKEN recording, so never pick an audio-only source (or an unnamed one).
+      const AUDIO_ONLY = /\.(mp3|wav|aif|aiff|m4a|aac|flac|ogg|wma)$/i;
+      function coverageOf(key) {
+        let cov = 0;
+        for (const w of dedupeWindows(bySource[key])) cov += (w.outSec - w.inSec);
+        return cov;
+      }
+      const srcCov = [];
+      let bestSrc = null, bestCov = -1;
+      for (const key in bySource) {
+        const cov = coverageOf(key);
+        srcCov.push(key + "=" + cov.toFixed(0) + "s");
+        if (AUDIO_ONLY.test(key) || key === "(unnamed)") continue;  // skip music/SFX
+        if (cov > bestCov) { bestCov = cov; bestSrc = key; }
+      }
+      // Fall back to the largest source only if every source was audio/unnamed.
+      if (bestSrc === null) {
+        for (const key in bySource) {
+          const cov = coverageOf(key);
+          if (cov > bestCov) { bestCov = cov; bestSrc = key; }
+        }
+      }
 
-      if (text) {
-        apiMap[seq.id] = text;
-        setRowIcon(seq.id, "ok", "transcribed");
+      const windows = dedupeWindows(bySource[bestSrc]).sort((a, b) => (a.startSec || 0) - (b.startSec || 0));
+      const nestedWarn = /sequence/i.test(bestSrc) ? " [⚠ nested sequence — timecodes may be relative]" : "";
+
+      // Slice from the largest transcript whose span covers these windows.
+      const maxOut = Math.max.apply(null, windows.map(w => w.outSec));
+      const src = transcripts.find(t => t.span >= maxOut - 1) || transcripts[0];
+
+      const parts = [];
+      const winLabels = [];
+      for (const w of windows) {
+        const txt = sliceWords(src.words, w.inSec, w.outSec);
+        winLabels.push(w.inSec.toFixed(0) + "-" + w.outSec.toFixed(0));
+        if (txt && txt.trim().length > 0) parts.push(txt.trim());
+      }
+      const joined = parts.join(" ").trim();
+
+      if (joined.length > 0) {
+        textMap[seq.id]   = joined;
+        methodMap[seq.id] = "slice doc" + src.objId;
+        diag.push(seq.name + ': source "' + bestSrc + '"' + nestedWarn + " (sources: " + srcCov.join(", ") + "); " +
+          windows.length + " window(s) [" + winLabels.join(", ") + "]s → " +
+          joined.split(/\s+/).length + " words from doc" + src.objId);
       } else {
-        setRowIcon(seq.id, "warn", "timed out");
+        diag.push(seq.name + ': source "' + bestSrc + '", window(s) [' + winLabels.join(", ") +
+          "]s produced no words (source may not be the transcribed recording)");
       }
     }
   }
 
-  // 6. Write .txt files. Skip sequences with no real text — empty/short outputs
-  // were previously clip-name garbage (Graphic, Adjustment Layer, etc).
+  // 5. Write .txt files
   let ok = 0, skipped = 0;
   setStatus("Writing files…", "");
-
   const usedFilenames = new Set();
   for (const seq of targets) {
-    const text     = apiMap[seq.id] || parsedMap[seq.id] || null;
+    const text     = textMap[seq.id] || null;
     const method   = methodMap[seq.id] || "none";
     const baseName = sanitize(seq.name);
-    // Two sequences with the same name would silently overwrite each other.
-    // Append a counter (" (2).txt") to keep both.
+    // Two sequences with the same name would silently overwrite each other —
+    // append a counter to keep both.
     let fileName = baseName + ".txt";
     let n = 2;
-    while (usedFilenames.has(fileName.toLowerCase())) {
-      fileName = baseName + " (" + n + ").txt";
-      n++;
-    }
+    while (usedFilenames.has(fileName.toLowerCase())) { fileName = baseName + " (" + n + ").txt"; n++; }
     usedFilenames.add(fileName.toLowerCase());
     const outPath = path.join(transcriptsDir, fileName);
 
     const cleaned = text ? cleanTranscript(text) : "";
-    const looksReal = cleaned.length >= 20;
-
-    if (looksReal) {
+    if (cleaned.length >= 20) {
       try {
         fs.writeFileSync(outPath, cleaned, "utf8");
         setRowIcon(seq.id, "ok", method);
@@ -510,62 +531,28 @@ async function runExportInner() {
       }
     } else {
       const icon = document.getElementById("icon-" + seq.id);
-      if (icon && !icon.classList.contains("warn")) {
-        const reason = cleaned.length === 0 ? "no transcript" : "too short (" + cleaned.length + ")";
-        setRowIcon(seq.id, "warn", reason);
-      }
+      if (icon && !icon.classList.contains("warn")) setRowIcon(seq.id, "warn", "no transcript");
       skipped++;
     }
   }
 
-  // Write diagnostic so we can see why anything failed without console access.
+  // 6. Diagnostic file (so failures are explainable without the console)
   try {
-    const lines = ["Transcript extraction diagnostic", "Generated: " + new Date().toISOString(), ""];
-    if (parseDiag.length > 0) {
-      lines.push("=== .prproj parse ===");
-      for (const d of parseDiag) lines.push(d);
-      lines.push("");
-    }
+    const lines = ["Transcript slice diagnostic", "Generated: " + new Date().toISOString(), ""];
+    for (const d of diag) lines.push(d);
+    lines.push("");
     for (const seq of targets) {
-      const method = apiMap[seq.id] ? (methodMap[seq.id] || "API") : (parsedMap[seq.id] ? "prproj-parse" : "none");
-      const wrote  = (apiMap[seq.id] || parsedMap[seq.id]) ? "WROTE via " + method : "EMPTY (method=" + method + ")";
-      lines.push("--- " + seq.name + " ---");
-      lines.push("Result: " + wrote);
-      lines.push("ExtendScript attempts:");
-      const att = attemptsByName[seq.name] || [];
-      if (att.length === 0) lines.push("  (none recorded)");
-      else for (const a of att) lines.push("  - " + a);
-      lines.push("");
+      const t = textMap[seq.id];
+      lines.push("--- " + seq.name + " --- " + (t ? ("WROTE via " + (methodMap[seq.id] || "?")) : "EMPTY"));
     }
     fs.writeFileSync(path.join(transcriptsDir, "_diagnostic.txt"), lines.join("\n"), "utf8");
   } catch (e) { console.warn("Could not write diagnostic file:", e); }
-
-  // If any sequence went unmatched but the project has unused dedicated
-  // transcripts, write them out so the user can match manually by reading
-  // the previews.
-  if (unmatchedDocs.length > 0) {
-    try {
-      const lines = ["Unused dedicated transcripts in this project", "", "These are short transcripts (< 500 words) that weren't matched to any", "sequence by name. Read the previews below, then rename whichever one", "matches your unmatched sequence(s).", ""];
-      for (const u of unmatchedDocs) {
-        lines.push("================================================================");
-        lines.push("Doc ObjectID " + u.objId + " (" + u.wc + " words)");
-        lines.push("================================================================");
-        lines.push(u.text);
-        lines.push("");
-      }
-      fs.writeFileSync(path.join(transcriptsDir, "_unmatched_docs.txt"), lines.join("\n"), "utf8");
-    } catch (e) { console.warn("Could not write _unmatched_docs.txt:", e); }
-  }
 
   // 7. Final status
   if (skipped === 0) {
     setStatus(`✓ ${ok} transcript(s) exported.`, "ok");
   } else {
-    setStatus(
-      `${ok} exported, ${skipped} skipped.` +
-      (skipped > 0 ? " Yellow rows need Speech to Text in Premiere's Text panel." : ""),
-      ok > 0 ? "" : "err"
-    );
+    setStatus(`${ok} exported, ${skipped} skipped — see _diagnostic.txt for why.`, ok > 0 ? "" : "err");
   }
 
   if (ok > 0) outputLink.style.display = "block";
@@ -600,6 +587,151 @@ async function pollForTranscript(seqId, maxSeconds, intervalMs) {
   }
 
   return null;
+}
+
+// ─── Timed-transcript parsing + slicing (podcast / shared-source projects) ───
+// In a podcast-style project, many short clips are cut from ONE long recording
+// that has a single transcript. There is no per-clip transcript to grab — so we
+// read the recording's transcript out of the .prproj WITH word-level timings,
+// then slice it to just the words inside each clip's source in/out window.
+//
+// Each transcript is a FlatBuffer of word records. A word record is a table
+// whose fields are: slot 0 = start time (Premiere ticks, int64), slot 1 =
+// duration (ticks), slot 2 = the word string. Dividing ticks by the tick rate
+// gives seconds, which line up with a clip's inPoint/outPoint from getSequenceWindows().
+const PPRO_TICKS = 254016000000;
+
+// Read every timed transcript out of the project file. Returns
+// [{ objId, words:[{s, start}], span, wordCount }], longest transcript first.
+function parseTimedTranscripts(prprojPath) {
+  const buffer = fs.readFileSync(prprojPath);
+  const xml = decompressProjectFile(buffer);
+  const docs = [];
+  const re = /<ExternallyProvidedTranscriptDocument ObjectID="(\d+)"[^>]*>[\s\S]*?<TranscriptData Encoding="base64"[^>]*>([\s\S]*?)<\/TranscriptData>/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const objId = m[1];
+    const b64 = m[2].replace(/\s+/g, "");
+    const words = decodeTimedWords(b64);
+    if (words.length === 0) continue;   // empty / placeholder transcript
+    let span = 0;
+    for (const w of words) if (w.start > span) span = w.start;
+    docs.push({ objId, words, span, wordCount: words.length });
+  }
+  docs.sort((a, b) => b.wordCount - a.wordCount);
+  return docs;
+}
+
+// Recover [{s, start(seconds)}] from one base64 transcript FlatBuffer.
+function decodeTimedWords(base64) {
+  if (!base64 || base64.length < 200) return [];
+  let buf;
+  try { buf = Buffer.from(base64, "base64"); } catch (e) { return []; }
+
+  // 1. Index every FlatBuffer string object that looks like a transcript word.
+  //    Strings are stored as [uint32 length][utf8 bytes][NUL].
+  const bySp = Object.create(null);
+  for (let i = 0; i < buf.length - 4; i++) {
+    const len = buf.readUInt32LE(i);
+    if (len < 1 || len > 120) continue;
+    if (i + 4 + len >= buf.length) continue;
+    if (buf[i + 4 + len] !== 0) continue;
+    let ok = true;
+    for (let j = 0; j < len; j++) {
+      const b = buf[i + 4 + j];
+      if (b < 0x09 || (b > 0x0a && b < 0x20)) { ok = false; break; }
+    }
+    if (!ok) continue;
+    const s = buf.slice(i + 4, i + 4 + len).toString("utf8");
+    if (isTranscriptWord(s)) bySp[i] = s;
+  }
+
+  // 2. Find string-field pointers: a uint32 offset that resolves to a string.
+  const words = [];
+  for (let P = 0; P < buf.length - 4; P++) {
+    const off = buf.readUInt32LE(P);
+    if (off < 4 || off >= 200) continue;
+    const target = P + off;
+    const s = bySp[target];
+    if (s === undefined) continue;
+    if (s === "en-us" || s === "Unknown" || s === "und-zz") continue;
+
+    // 3. Resolve the word's table via the vtable; slot 0 = start ticks.
+    const fields = resolveFlatBufferTable(buf, P);
+    if (!fields) continue;
+    const p0 = fields[0];
+    if (p0 == null || p0 + 8 > buf.length) continue;
+    const startTicks = readU64LE(buf, p0);
+    if (startTicks == null) continue;
+    words.push({ s, start: startTicks / PPRO_TICKS });
+  }
+
+  words.sort((a, b) => a.start - b.start);
+  return words;
+}
+
+// Walk back from a string-field position to the FlatBuffer table that owns it,
+// returning the absolute positions of each field slot. The vtable header is
+// u16 vtableSize, u16 tableSize, then u16 field offsets relative to the table.
+function resolveFlatBufferTable(buf, P) {
+  for (let T = P; T >= P - 60 && T >= 0; T--) {
+    const soff = buf.readInt32LE(T);
+    const vt = T - soff;
+    if (vt < 0 || vt + 4 > buf.length) continue;
+    const vtSize = buf.readUInt16LE(vt);
+    const tblSize = buf.readUInt16LE(vt + 2);
+    if (vtSize < 4 || vtSize > 64 || (vtSize % 2) || tblSize < 4 || tblSize > 128) continue;
+    const fields = [];
+    let hit = false;
+    for (let o = vt + 4; o + 2 <= vt + vtSize; o += 2) {
+      const foff = buf.readUInt16LE(o);
+      const pos = foff ? T + foff : null;
+      fields.push(pos);
+      if (pos === P) hit = true;
+    }
+    if (hit) return fields;
+  }
+  return null;
+}
+
+// Read a little-endian uint64 as a JS number (transcript times stay well under
+// 2^53, so precision is exact). Avoids BigInt, which old CEP Node lacks.
+function readU64LE(buf, pos) {
+  if (pos == null || pos + 8 > buf.length) return null;
+  const lo = buf.readUInt32LE(pos);
+  const hi = buf.readUInt32LE(pos + 4);
+  return hi * 4294967296 + lo;
+}
+
+function isTranscriptWord(s) {
+  if (!/[a-zA-Z]/.test(s)) return false;
+  if (/[@|`={}<>%#$^~\[\]\\\/+*]/.test(s)) return false;
+  const letters = (s.match(/[a-zA-Z]/g) || []).length;
+  return letters / s.length >= 0.6;
+}
+
+// Slice a timed word list to the half-open window [inSec, outSec) and join.
+function sliceWords(words, inSec, outSec) {
+  const out = [];
+  for (const w of words) {
+    if (w.start >= inSec && w.start < outSec) out.push(w.s);
+  }
+  return out.join(" ");
+}
+
+// Collapse identical source windows (a clip's video + audio + stereo track items
+// all report the same [inSec, outSec], which would otherwise slice — and
+// concatenate — the same words two or three times).
+function dedupeWindows(ws) {
+  const seen = Object.create(null);
+  const out = [];
+  for (const w of ws) {
+    const k = w.inSec.toFixed(2) + "|" + w.outSec.toFixed(2);
+    if (seen[k]) continue;
+    seen[k] = true;
+    out.push(w);
+  }
+  return out;
 }
 
 // ─── Project file parser ──────────────────────────────────────────────────────

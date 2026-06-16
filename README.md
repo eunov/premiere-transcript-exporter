@@ -6,7 +6,7 @@ This is a small Premiere Pro panel that does exactly that. Open it, click one bu
 
 ## Requirements
 
-You'll need Premiere Pro 2022 (v22.0) or later, since that's when Speech to Text shipped. The install script in this repo is written for macOS; Windows users can install by hand using the steps further down. And each sequence has to have already had Speech to Text run on it (Text panel, then the Transcript tab) before the panel can export anything from it.
+You'll need Premiere Pro 2022 (v22.0) or later, since that's when Speech to Text shipped. The install script in this repo is written for macOS; Windows users can install by hand using the steps further down. The footage your sequences are built from has to have had Speech to Text run on it (Text panel, then the Transcript tab) — the panel reads that transcript and gives each sequence just its own portion. If a clip is cut from a recording that was never transcribed, there's nothing to export for it.
 
 ## Install on macOS
 
@@ -37,12 +37,18 @@ As the export runs, each sequence gets a colored dot next to its name. Green mea
 
 ## How it pulls the transcripts
 
-There are three different ways to get transcript text out of Premiere, and the panel tries them in order. First it asks the scripting API directly using `sequence.getText()`, which works on Premiere Pro 23.3 and up. If that comes back empty, it walks each sequence's video tracks looking for caption clips and reads the text off of those. If both of those still give nothing, it falls back to decompressing the `.prproj` file itself and scanning the XML inside for caption and transcript nodes. That last path is what catches data even when the scripting API doesn't surface it.
+On older Premiere the panel first asks the scripting API for a whole-sequence transcript (`sequence.getText()`). Premiere Pro 26 removed that API, so the panel's main path is different: it reads the Speech to Text transcript out of the `.prproj` file *with word-level timings*, then asks Premiere for each sequence's clip in/out points and slices the transcript down to just the words inside each clip.
+
+This is what makes podcast-style projects work. When many short clips are cut from one long recording, there is only one transcript (the recording's) — not a separate transcript per clip. Older versions of this panel tried to guess which whole transcript belonged to which clip by name and got it wrong: a 60-second clip would come out with the entire podcast, or with nothing. Slicing by the clip's actual in/out point gives each sequence exactly its own words.
+
+A sequence exports if (a) its clips are linked to source footage that has a transcript, and (b) Premiere reports the clip in/out points. If a sequence comes back empty, `transcripts/_diagnostic.txt` shows the window it tried to slice and why it found no words.
 
 ## Troubleshooting
 
 **The panel doesn't show up in Window > Extensions.** First check that the install script actually finished without errors. Then confirm `PlayerDebugMode` is set by running `defaults read com.adobe.CSXS.11 PlayerDebugMode` in Terminal. If both of those check out, quit Premiere and reopen it.
 
-**Every sequence shows up as "no transcript."** Open the Text panel inside Premiere (Window > Text), pick a sequence, and look at the Transcript tab. If it's blank, you need to click Transcribe and let Speech to Text actually run before the exporter has anything to grab.
+**Every sequence shows up as "no transcript."** Open the Text panel inside Premiere (Window > Text), select the source footage the clips were cut from, and look at the Transcript tab. If it's blank, click Transcribe and let Speech to Text run — the panel slices that transcript, so the source has to have one.
 
-**The transcript text looks garbled.** Usually this means the project file is large and the parser is reading an older saved copy. Hit the ↻ Refresh button in the panel and export again. The plugin saves the project before parsing, so a refresh clears up most of these cases.
+**A clip exported the wrong part of the recording.** Open `transcripts/_diagnostic.txt`. It lists, per sequence, the in/out window (in seconds) it sliced. If a window is off, the clip's source in/out points in Premiere are what drive it — confirm the clip is a straight trim of the transcribed recording.
+
+**The transcript text looks garbled or stale.** Usually the project file is large and an older saved copy is being read. Hit the ↻ Refresh button and export again. The panel saves the project before parsing, which clears up most of these.
